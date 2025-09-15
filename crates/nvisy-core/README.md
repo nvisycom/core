@@ -1,4 +1,4 @@
-### nvisy
+### nvisy/core
 
 [![Build Status][action-badge]][action-url]
 [![Crate Coverage][coverage-badge]][coverage-url]
