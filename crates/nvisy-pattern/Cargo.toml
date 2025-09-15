@@ -1,7 +1,7 @@
 # https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package]
-name = "nvisy-error"
+name = "nvisy-pattern"
 version = { workspace = true }
 rust-version = { workspace = true }
 edition = { workspace = true }
@@ -18,15 +18,13 @@ documentation = { workspace = true }
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[features]
-default = ["serde"]
-serde = ["dep:serde", "hipstr/serde", "jiff?/serde"]
-jiff = ["dep:jiff"]
-
 [dependencies]
-thiserror = { workspace = true, features = ["std"] }
-hipstr = { workspace = true, features = ["std"] }
-strum = { workspace = true, features = ["derive"] }
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+strum = { version = "0.26", features = ["derive"] }
 
-serde = { workspace = true, features = ["std", "derive"], optional = true }
-jiff = { workspace = true, features = ["std"], optional = true }
+[features]
+default = []
+
+[dev-dependencies]
+serde_json = "1.0"

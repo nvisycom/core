@@ -1,7 +1,7 @@
 # https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [package]
-name = "nvisy-core"
+name = "nvisy-engine"
 version = { workspace = true }
 rust-version = { workspace = true }
 edition = { workspace = true }
@@ -19,31 +19,18 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
+default = ["serde"]
 serde = ["dep:serde"]
 
 [dependencies]
-# Async runtime and I/O
-tokio = { workspace = true, features = ["fs", "io-util", "rt", "macros"] }
+# Internal crates
+nvisy-core = { workspace = true }
 
 # Data structures and utilities
-uuid = { workspace = true, features = ["v7", "serde", "std"] }
-jiff = { workspace = true, features = ["std"] }
 bytes = { workspace = true, features = ["serde"] }
 
-# Cryptography
-sha2 = { workspace = true, features = [] }
-hex = { version = "0.4", features = [] }
-
-# Serialization
+# Serialization (optional)
 serde = { workspace = true, optional = true, features = ["derive"] }
-
-# Utilities
-strum = { workspace = true, features = ["derive"] }
-
-# Error handling
-nvisy-error = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
-tempfile = { workspace = true, features = [] }

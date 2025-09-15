@@ -1,0 +1,422 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., v1.0.0)"
+        required: true
+        type: string
+      dry-run:
+        description: "Dry run (no actual release)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  RUST_VERSION: "1.84"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  prepare:
+    name: Prepare Release
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      is-prerelease: ${{ steps.version.outputs.is-prerelease }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+            TAG="${{ inputs.version }}"
+          else
+            TAG=${GITHUB_REF#refs/tags/}
+            VERSION=${TAG#v}
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+          # Check if this is a prerelease (contains alpha, beta, rc, etc.)
+          if [[ "$VERSION" =~ (alpha|beta|rc|pre) ]]; then
+            echo "is-prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is-prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "📋 Release version: $VERSION"
+          echo "🏷️  Release tag: $TAG"
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9\.-]+)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            echo "Expected format: X.Y.Z or X.Y.Z-prerelease"
+            exit 1
+          fi
+          echo "✅ Version format is valid"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          echo "📝 Generating changelog..."
+
+          # Get the previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            echo "📊 Changes since $PREVIOUS_TAG:"
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" "$PREVIOUS_TAG"..HEAD)
+          else
+            echo "📊 All changes (no previous tag found):"
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" HEAD)
+          fi
+
+          # Save changelog to output
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Save to file for artifact
+          cat > CHANGELOG.md << EOF
+          # Release ${{ steps.version.outputs.tag }}
+
+          $CHANGELOG
+          EOF
+
+      - name: Upload changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: CHANGELOG.md
+          retention-days: 30
+
+  security-check:
+    name: Pre-Release Security Check
+    runs-on: ubuntu-24.04
+    needs: prepare
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-security
+
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Run security audit
+        run: |
+          echo "🔒 Running pre-release security audit..."
+          cargo audit --deny warnings
+
+          if [ -f "deny.toml" ]; then
+            cargo deny check
+          fi
+
+      - name: Validate no unsafe code (if configured)
+        run: |
+          echo "⚠️  Checking for unsafe code..."
+          if grep -r "unsafe " crates/*/src/ --include="*.rs" | grep -v "test" | grep -v "benchmark"; then
+            echo "❌ Found unsafe code in release candidate"
+            echo "Please review and ensure all unsafe code is properly documented and justified"
+            exit 1
+          fi
+          echo "✅ No unsafe code found"
+
+  test:
+    name: Pre-Release Testing
+    runs-on: ubuntu-24.04
+    needs: prepare
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-test-${{ matrix.os }}
+
+      - name: Run comprehensive tests
+        run: |
+          cargo test --workspace --locked --all-features --release
+          cargo test --workspace --locked --all-features --release --doc
+
+  build:
+    name: Build Release Artifacts
+    runs-on: ${{ matrix.config.os }}
+    needs: [prepare, security-check, test]
+    strategy:
+      matrix:
+        config:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            suffix: ""
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            suffix: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: .exe
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.config.target }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-build-${{ matrix.config.target }}
+
+      - name: Install musl tools
+        if: matrix.config.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Build release binaries
+        run: |
+          cargo build --workspace --release --locked --target ${{ matrix.config.target }}
+
+      - name: Create release archives
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TARGET="${{ matrix.config.target }}"
+
+          # Create directory structure
+          mkdir -p "nvisy-$VERSION-$TARGET"
+
+          # Copy binaries (if any exist)
+          if [ -d "target/$TARGET/release" ]; then
+            find "target/$TARGET/release" -maxdepth 1 -type f -executable -name "nvisy*" | while read -r binary; do
+              if [[ "$binary" != *.d && "$binary" != *deps* ]]; then
+                cp "$binary" "nvisy-$VERSION-$TARGET/"
+              fi
+            done
+          fi
+
+          # Copy license and readme
+          cp LICENSE.txt "nvisy-$VERSION-$TARGET/"
+          cp README.md "nvisy-$VERSION-$TARGET/"
+
+          # Create changelog for this release
+          if [ -f "CHANGELOG.md" ]; then
+            cp CHANGELOG.md "nvisy-$VERSION-$TARGET/"
+          fi
+
+          # Create archive
+          if [[ "${{ matrix.config.os }}" == "windows-latest" ]]; then
+            7z a "nvisy-$VERSION-$TARGET.zip" "nvisy-$VERSION-$TARGET"
+            echo "ASSET=nvisy-$VERSION-$TARGET.zip" >> $GITHUB_ENV
+          else
+            tar -czf "nvisy-$VERSION-$TARGET.tar.gz" "nvisy-$VERSION-$TARGET"
+            echo "ASSET=nvisy-$VERSION-$TARGET.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.config.target }}
+          path: ${{ env.ASSET }}
+          retention-days: 30
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [prepare, security-check, test, build]
+    if: ${{ !inputs.dry-run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          body: |
+            # Nvisy Core ${{ needs.prepare.outputs.version }}
+
+            ## What's Changed
+
+            ${{ needs.prepare.outputs.changelog }}
+
+            ## Installation
+
+            ### Using Cargo
+
+            ```bash
+            cargo add nvisy-core@${{ needs.prepare.outputs.version }}
+            cargo add nvisy-types@${{ needs.prepare.outputs.version }}
+            cargo add nvisy-error@${{ needs.prepare.outputs.version }}
+            cargo add nvisy-io@${{ needs.prepare.outputs.version }}
+            ```
+
+            ### Download Binaries
+
+            Download the appropriate binary for your platform from the assets below.
+
+            ## Checksums
+
+            All release artifacts are signed and their checksums are available in the release assets.
+
+            ---
+
+            **Full Changelog**: https://github.com/nvisycom/core/compare/...HEAD
+          draft: false
+          prerelease: ${{ needs.prepare.outputs.is-prerelease == 'true' }}
+          files: |
+            artifacts/release-*/*
+            artifacts/changelog/CHANGELOG.md
+          generate_release_notes: true
+          make_latest: ${{ needs.prepare.outputs.is-prerelease == 'false' }}
+
+  publish-crates:
+    name: Publish to Crates.io
+    runs-on: ubuntu-24.04
+    needs: [prepare, security-check, test, build, create-release]
+    if: ${{ !inputs.dry-run && needs.prepare.outputs.is-prerelease == 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-publish
+
+      - name: Verify crates can be packaged
+        run: |
+          cargo package --workspace --allow-dirty
+
+      - name: Publish crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: |
+          echo "📦 Publishing crates to crates.io..."
+
+          # Publish in dependency order
+          crates=("nvisy-error" "nvisy-types" "nvisy-io" "nvisy-core")
+
+          for crate in "${crates[@]}"; do
+            echo "📦 Publishing $crate..."
+            cd "crates/$crate"
+
+            # Check if this version is already published
+            if cargo search "$crate" --limit 1 | grep -q "${{ needs.prepare.outputs.version }}"; then
+              echo "⚠️  Version ${{ needs.prepare.outputs.version }} of $crate is already published, skipping..."
+            else
+              cargo publish --allow-dirty
+              echo "✅ Published $crate@${{ needs.prepare.outputs.version }}"
+              # Wait a bit to ensure crates.io processes the upload
+              sleep 30
+            fi
+
+            cd ../..
+          done
+
+      - name: Notify if no registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: |
+          echo "⚠️  No CARGO_REGISTRY_TOKEN found, skipping crates.io publication"
+          echo "To enable automatic publishing, add your crates.io API token as CARGO_REGISTRY_TOKEN secret"
+
+  post-release:
+    name: Post-Release Tasks
+    runs-on: ubuntu-24.04
+    needs: [
+      prepare,
+      security-check,
+      test,
+      build,
+      create-release,
+      publish-crates,
+    ]
+    if: always() && !inputs.dry-run
+    steps:
+      - name: Release Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Task | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Preparation | ${{ needs.prepare.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Check | ${{ needs.security-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Testing | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Artifacts | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| GitHub Release | ${{ needs.create-release.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Crates.io Publish | ${{ needs.publish-crates.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ needs.create-release.result }}" == "success" ]]; then
+            echo "🎉 **Release ${{ needs.prepare.outputs.tag }} created successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "📦 **Release URL**: https://github.com/nvisycom/core/releases/tag/${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Release creation failed**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [[ "${{ needs.publish-crates.result }}" == "success" ]]; then
+            echo "📚 **Crates published to crates.io**" >> $GITHUB_STEP_SUMMARY
+          elif [[ "${{ needs.publish-crates.result }}" == "skipped" ]]; then
+            echo "⚠️  **Crates.io publishing skipped** (prerelease or no token)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Crates.io publishing failed**" >> $GITHUB_STEP_SUMMARY
+          fi

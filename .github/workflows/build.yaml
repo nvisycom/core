@@ -1,0 +1,335 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.84"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-24.04
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
+      docs: ${{ steps.changes.outputs.docs }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rustfmt.toml'
+              - '.github/workflows/**'
+            docs:
+              - '**.md'
+              - 'LICENSE.txt'
+
+  format:
+    name: Run Cargo Format
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true'
+    needs: changes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt
+
+      - name: Run Cargo Format
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Run Cargo Clippy
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true'
+    needs: changes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: Run Cargo Clippy
+        run: |
+          cargo clippy \
+            --workspace \
+            --locked \
+            --all-features \
+            --all-targets \
+            -- -D warnings
+
+  test:
+    name: Run Cargo Test
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true'
+    needs: changes
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: llvm-tools-preview
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Run Cargo Test
+        run: |
+          cargo test \
+            --workspace \
+            --locked \
+            --all-features
+
+      - name: Generate coverage (Ubuntu only)
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          cargo llvm-cov test \
+            --workspace \
+            --all-features \
+            --lcov \
+            --output-path coverage.lcov
+
+      - name: Upload coverage reports
+        if: matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: coverage.lcov
+          retention-days: 30
+
+  build:
+    name: Run Cargo Build
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true'
+    needs: changes
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Run Cargo Build
+        run: |
+          cargo build \
+            --workspace \
+            --release \
+            --locked \
+            --target ${{ matrix.target }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/
+          retention-days: 7
+
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.docs == 'true'
+    needs: changes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          cargo doc \
+            --workspace \
+            --all-features \
+            --no-deps \
+            --document-private-items
+
+      - name: Upload documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: target/doc/
+          retention-days: 30
+
+  security:
+    name: Run Security Audit
+    runs-on: ubuntu-24.04
+    if: needs.changes.outputs.rust == 'true'
+    needs: changes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: security
+
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Run security audit
+        run: cargo audit --deny warnings
+
+      - name: Check licenses and dependencies
+        run: |
+          if [ ! -f "deny.toml" ]; then
+            cat > deny.toml << 'EOF'
+          [advisories]
+          version = 2
+          vulnerability = "deny"
+          unmaintained = "warn"
+          yanked = "warn"
+          notice = "warn"
+
+          [licenses]
+          version = 2
+          allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-DFS-2016", "CC0-1.0"]
+          deny = []
+          copyleft = "warn"
+          default = "deny"
+
+          [bans]
+          multiple-versions = "warn"
+          wildcards = "allow"
+          highlight = "all"
+
+          [sources]
+          version = 2
+          unknown-registry = "warn"
+          unknown-git = "warn"
+          allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+          EOF
+          fi
+          cargo deny check
+
+  summary:
+    name: Build Summary
+    runs-on: ubuntu-24.04
+    needs: [changes, format, clippy, test, build, docs, security]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Changes | ${{ needs.changes.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Clippy | ${{ needs.clippy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | ${{ needs.test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build | ${{ needs.build.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docs | ${{ needs.docs.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Check if any required job failed
+          failed_jobs=()
+
+          if [[ "${{ needs.changes.outputs.rust }}" == "true" ]]; then
+            if [[ "${{ needs.format.result }}" != "success" ]]; then
+              failed_jobs+=("Format")
+            fi
+            if [[ "${{ needs.clippy.result }}" != "success" ]]; then
+              failed_jobs+=("Clippy")
+            fi
+            if [[ "${{ needs.test.result }}" != "success" ]]; then
+              failed_jobs+=("Test")
+            fi
+            if [[ "${{ needs.build.result }}" != "success" ]]; then
+              failed_jobs+=("Build")
+            fi
+            if [[ "${{ needs.security.result }}" != "success" ]]; then
+              failed_jobs+=("Security")
+            fi
+          fi
+
+          if [[ "${{ needs.docs.result }}" != "success" ]] && [[ "${{ needs.docs.result }}" != "skipped" ]]; then
+            failed_jobs+=("Docs")
+          fi
+
+          if [ ${#failed_jobs[@]} -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Failed jobs:** ${failed_jobs[*]}" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All jobs completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          fi
