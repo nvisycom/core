@@ -1,0 +1,351 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  push:
+    branches:
+      - "main"
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/security.yaml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/security.yaml"
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.84"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  rust-security:
+    name: Run Rust Security Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: security
+
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+
+      - name: Run vulnerability audit
+        run: |
+          echo "🔍 Running vulnerability audit..."
+          cargo audit --deny warnings --format json > audit-results.json || true
+          cargo audit --deny warnings
+
+      - name: Check licenses and dependencies
+        run: |
+          echo "📋 Checking licenses and dependencies..."
+          if [ ! -f "deny.toml" ]; then
+            echo "Creating deny.toml configuration..."
+            cat > deny.toml << 'EOF'
+          [advisories]
+          version = 2
+          vulnerability = "deny"
+          unmaintained = "warn"
+          yanked = "warn"
+          notice = "warn"
+          ignore = [
+              # Add any CVEs to ignore here
+          ]
+
+          [licenses]
+          version = 2
+          allow = [
+              "MIT",
+              "Apache-2.0",
+              "Apache-2.0 WITH LLVM-exception",
+              "BSD-2-Clause",
+              "BSD-3-Clause",
+              "ISC",
+              "Unicode-DFS-2016",
+              "CC0-1.0"
+          ]
+          deny = []
+          copyleft = "warn"
+          allow-osi-fsf-libre = "neither"
+          default = "deny"
+          confidence-threshold = 0.8
+
+          [bans]
+          multiple-versions = "warn"
+          wildcards = "allow"
+          highlight = "all"
+          workspace-default-features = "allow"
+          external-default-features = "allow"
+          skip = []
+          skip-tree = []
+
+          [sources]
+          version = 2
+          unknown-registry = "warn"
+          unknown-git = "warn"
+          allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+          allow-git = []
+          EOF
+          fi
+          cargo deny check
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-security-reports
+          path: |
+            audit-results.json
+            deny.toml
+          retention-days: 90
+
+  dependency-analysis:
+    name: Run Dependency Analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: dependency-analysis
+
+      - name: Install dependency analysis tools
+        run: |
+          cargo install cargo-machete --locked
+          cargo install cargo-outdated --locked
+          cargo install cargo-tree --locked
+
+      - name: Analyze unused dependencies
+        run: |
+          echo "🔍 Checking for unused dependencies..."
+          cargo machete > unused-deps.txt 2>&1 || true
+          if [ -s unused-deps.txt ]; then
+            echo "⚠️  Found potentially unused dependencies:"
+            cat unused-deps.txt
+          else
+            echo "✅ No unused dependencies found"
+          fi
+
+      - name: Check outdated dependencies
+        run: |
+          echo "📊 Checking for outdated dependencies..."
+          cargo outdated --workspace --format json > outdated-deps.json 2>&1 || true
+          cargo outdated --workspace > outdated-deps.txt 2>&1 || true
+          if [ -s outdated-deps.txt ]; then
+            echo "📋 Dependency status:"
+            cat outdated-deps.txt
+          fi
+
+      - name: Generate dependency tree
+        run: |
+          echo "🌳 Generating dependency tree..."
+          cargo tree --workspace --format "{p} {f}" > dependency-tree.txt 2>&1 || true
+
+      - name: Analyze dependency licenses
+        run: |
+          echo "📄 Analyzing dependency licenses..."
+          cargo tree --workspace --format "{p} {l}" --prefix none | sort -u > dependency-licenses.txt 2>&1 || true
+
+      - name: Upload dependency reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-analysis-reports
+          path: |
+            unused-deps.txt
+            outdated-deps.json
+            outdated-deps.txt
+            dependency-tree.txt
+            dependency-licenses.txt
+          retention-days: 90
+
+  secret-scan:
+    name: Run Secret Scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+      - name: Create gitleaks config
+        if: failure()
+        run: |
+          cat > .gitleaks.toml << 'EOF'
+          [extend]
+          useDefault = true
+
+          [[rules]]
+          id = "nvisy-api-key"
+          description = "Nvisy API Key"
+          regex = '''nvisy[_-]?api[_-]?key['\"\s]*[:=]['\"\s]*[a-zA-Z0-9]{32,}'''
+          tags = ["api", "nvisy"]
+
+          [[rules]]
+          id = "nvisy-secret-key"
+          description = "Nvisy Secret Key"
+          regex = '''nvisy[_-]?secret[_-]?key['\"\s]*[:=]['\"\s]*[a-zA-Z0-9]{64,}'''
+          tags = ["secret", "nvisy"]
+
+          [allowlist]
+          description = "Allowlist for test files and documentation"
+          paths = [
+            '''.*test.*''',
+            '''.*example.*''',
+            '''.*README\.md''',
+            '''.*\.md'''
+          ]
+          EOF
+
+  supply-chain:
+    name: Run Supply Chain Analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: supply-chain
+
+      - name: Install supply chain tools
+        run: |
+          cargo install cargo-geiger --locked
+
+      - name: Run unsafe code analysis
+        run: |
+          echo "⚠️  Analyzing unsafe code usage..."
+          cargo geiger --format GitHubMarkdown > unsafe-analysis.md 2>&1 || true
+          cargo geiger > unsafe-analysis.txt 2>&1 || true
+
+      - name: Check for known malicious packages
+        run: |
+          echo "🕵️  Checking for known malicious packages..."
+          # Create a simple check for known bad package patterns
+          cat > check-malicious.sh << 'EOF'
+          #!/bin/bash
+
+          # List of known malicious or problematic package patterns
+          SUSPICIOUS_PATTERNS=(
+            "event-stream"
+            "eslint-scope"
+            "flatmap-stream"
+            "getcookies"
+            "rc"
+          )
+
+          echo "Checking dependency tree for suspicious packages..."
+          cargo tree --workspace --format "{p}" --prefix none | sort -u > all-deps.txt
+
+          for pattern in "${SUSPICIOUS_PATTERNS[@]}"; do
+            if grep -q "$pattern" all-deps.txt; then
+              echo "⚠️  Warning: Found potentially suspicious dependency: $pattern"
+            fi
+          done
+
+          echo "✅ Supply chain check completed"
+          EOF
+
+          chmod +x check-malicious.sh
+          ./check-malicious.sh
+
+      - name: Upload supply chain reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: supply-chain-reports
+          path: |
+            unsafe-analysis.md
+            unsafe-analysis.txt
+            all-deps.txt
+          retention-days: 90
+
+  summary:
+    name: Security Summary
+    runs-on: ubuntu-24.04
+    needs: [rust-security, dependency-analysis, secret-scan, supply-chain]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          echo "## Security Audit Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rust Security | ${{ needs.rust-security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Analysis | ${{ needs.dependency-analysis.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scan | ${{ needs.secret-scan.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Supply Chain | ${{ needs.supply-chain.result }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Count failures and warnings
+          failed_jobs=()
+
+          if [[ "${{ needs.rust-security.result }}" == "failure" ]]; then
+            failed_jobs+=("Rust Security")
+          fi
+          if [[ "${{ needs.secret-scan.result }}" == "failure" ]]; then
+            failed_jobs+=("Secret Scan")
+          fi
+
+          # Dependency analysis and supply chain are informational, so warnings are OK
+          if [[ "${{ needs.dependency-analysis.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️  **Dependency analysis had issues** - check reports for details" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [[ "${{ needs.supply-chain.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️  **Supply chain analysis had issues** - check reports for details" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ ${#failed_jobs[@]} -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Critical security jobs failed:** ${failed_jobs[*]}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please review the security reports and fix any critical issues before merging." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All critical security checks passed!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Review the uploaded reports for any warnings or recommendations." >> $GITHUB_STEP_SUMMARY
+          fi
